@@ -62,7 +62,7 @@ class DCASE2024(Dataset):
         
         image = self.transform(image)
         # ✅ Use a dummy mask for compatibility
-        mask = torch.zeros(image.shape[1:])  # Shape: [H, W]
+        mask = torch.ones(image.shape[1:])  # Shape: [H, W]
 
         return image, label, mask, class_name
 
@@ -92,8 +92,8 @@ class DCASE2024(Dataset):
                         image_paths.extend(test_files)
                         labels.extend([label] * len(test_files))  # 0 = normal, 1 = anomaly
                         class_names.extend([machine_type] * len(test_files))
-
-        return image_paths, labels, class_names
+        quat_size = 2
+        return image_paths[:quat_size], labels[:quat_size], class_names
 
     def update_class_to_idx(self, class_to_idx):
         """Update class-to-index mapping dynamically."""
