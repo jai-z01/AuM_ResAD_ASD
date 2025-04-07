@@ -15,6 +15,7 @@ from .datasets.mvtec import MVTEC
 from .datasets.visa import VISA
 import cv2
 import gc
+from tqdm import tqdm
 
 
 class BoundaryAverager:
@@ -38,44 +39,110 @@ def init_seeds(seed=0):
     torch.cuda.manual_seed_all(seed)
     
 
-def get_matched_ref_features(features: List[Tensor], ref_features: List[Tensor]) -> List[Tensor]:
-    """
-    Get matched reference features for one class.
-    """
-    torch.cuda.empty_cache()  # Free GPU memory before processing
+# def get_matched_ref_features(features: List[Tensor], ref_features: List[Tensor]) -> List[Tensor]:
+#     """
+#     Get matched reference features for one class.
+#     """
+#     torch.cuda.empty_cache()  # Free GPU memory before processing
 
+#     matched_ref_features = []
+#     chunk_size = 10000  # Reduce memory usage by processing in chunks
+
+#     for layer_id in range(len(features)):
+#         feature = features[layer_id]
+#         B, C, H, W = feature.shape
+#         feature = feature.permute(0, 2, 3, 1).reshape(-1, C).contiguous()  # (N1, C)
+#         feature_n = F.normalize(feature, p=2, dim=1)
+
+#         coreset = ref_features[layer_id].detach()  # Detach to prevent gradient tracking
+
+#         # Process in chunks to avoid OOM
+#         matched_features = []
+#         for coreset_chunk in coreset.split(chunk_size, dim=0):
+#             coreset_n = F.normalize(coreset_chunk, p=2, dim=1)
+#             dist = feature_n @ coreset_n.T  # Compute similarity
+
+#             cidx = torch.argmax(dist, dim=1)
+#             index_feats = coreset_chunk[cidx]
+            
+#             index_feats = index_feats.reshape(B, H, W, C).permute(0, 3, 1, 2)
+#             matched_features.append(index_feats)
+
+#         # Concatenate processed features
+#         matched_ref_features.append(torch.cat(matched_features, dim=0))
+
+#         # Free up memory
+#         del feature, feature_n, coreset, coreset_n, dist, cidx, index_feats
+#         torch.cuda.empty_cache()
+
+#     return matched_ref_features
+
+def get_matched_ref_features(features: List[Tensor], ref_features: List[Tensor], chunk_size=1000) -> List[Tensor]:
+    """
+    Get matched reference features for one class with memory-efficient chunk-wise processing.
+    
+    Args:
+        features (List[Tensor]): List of feature maps from different layers.
+        ref_features (List[Tensor]): List of reference features from different layers.
+        chunk_size (int): Number of rows processed at once to reduce memory usage.
+    
+    Returns:
+        List[Tensor]: List of matched reference features.
+    """
     matched_ref_features = []
-    chunk_size = 10000  # Reduce memory usage by processing in chunks
-
+    
     for layer_id in range(len(features)):
         feature = features[layer_id]
         B, C, H, W = feature.shape
         feature = feature.permute(0, 2, 3, 1).reshape(-1, C).contiguous()  # (N1, C)
         feature_n = F.normalize(feature, p=2, dim=1)
 
-        coreset = ref_features[layer_id].detach()  # Detach to prevent gradient tracking
+        coreset = ref_features[layer_id]  # (N2, C)
+        coreset_n = F.normalize(coreset, p=2, dim=1)
 
-        # Process in chunks to avoid OOM
-        matched_features = []
-        for coreset_chunk in coreset.split(chunk_size, dim=0):
-            coreset_n = F.normalize(coreset_chunk, p=2, dim=1)
-            dist = feature_n @ coreset_n.T  # Compute similarity
+        num_features = feature_n.shape[0]
+        num_coreset = coreset_n.shape[0]
+        
+        max_values = []
+        max_indices = []
 
-            cidx = torch.argmax(dist, dim=1)
-            index_feats = coreset_chunk[cidx]
+        # Process feature_n in chunks
+        for i in range(0, num_features, chunk_size):
+            chunk = feature_n[i:i + chunk_size]  # Take a small chunk of features
             
-            index_feats = index_feats.reshape(B, H, W, C).permute(0, 3, 1, 2)
-            matched_features.append(index_feats)
+            max_chunk_values = []
+            max_chunk_indices = []
 
-        # Concatenate processed features
-        matched_ref_features.append(torch.cat(matched_features, dim=0))
+            # Process coreset_n in chunks to prevent large transpose matrix
+            for j in range(0, num_coreset, chunk_size):
+                coreset_chunk = coreset_n[j:j + chunk_size]  # Small chunk of coreset
+                dist_chunk = torch.matmul(chunk, coreset_chunk.T)  # Compute distances
 
-        # Free up memory
-        del feature, feature_n, coreset, coreset_n, dist, cidx, index_feats
-        torch.cuda.empty_cache()
+                # Find max similarity within each coreset chunk
+                chunk_max_vals, chunk_max_idxs = torch.max(dist_chunk, dim=1)
+                
+                max_chunk_values.append(chunk_max_vals)
+                max_chunk_indices.append(chunk_max_idxs + j)  # Offset index by chunk start
+
+            # Merge max values and indices across coreset chunks
+            max_chunk_values = torch.stack(max_chunk_values, dim=0)
+            max_chunk_indices = torch.stack(max_chunk_indices, dim=0)
+            
+            # Find the best match across all chunks
+            best_chunk_idx = torch.argmax(max_chunk_values, dim=0)
+            best_values = max_chunk_values[best_chunk_idx, torch.arange(chunk.shape[0])]
+            best_indices = max_chunk_indices[best_chunk_idx, torch.arange(chunk.shape[0])]
+
+            max_values.append(best_values)
+            max_indices.append(best_indices)
+
+        # Merge all chunks
+        max_indices = torch.cat(max_indices, dim=0)
+        index_feats = coreset[max_indices]
+        index_feats = index_feats.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        matched_ref_features.append(index_feats)
 
     return matched_ref_features
-
 
 
 def get_residual_features(features: List[Tensor], ref_features: List[Tensor], pos_flag: bool = False) -> List[Tensor]:
@@ -308,52 +375,81 @@ def calculate_aupro(masks, amaps, max_step=200, expect_fpr=0.3):
         pro_auc = auc(fprs, pros[idxes])
         return pro_auc
 
+# def applying_EFDM(input_features_list, ref_features_list, alpha=0.5):
+#     alpha = 1 - alpha
+#     aligned_features_list = []
+
+#     for l in range(len(input_features_list)):
+#         input_features, ref_features = input_features_list[l], ref_features_list[l]
+#         B, C, W, H = input_features.shape
+
+#         # Move to CPU and convert to float16 to save memory
+#         input_features_r = input_features.reshape(B, C, -1).detach().cpu().to(torch.float16)
+#         ref_features_r = ref_features.reshape(B, C, -1).detach().cpu().to(torch.float16)
+
+#         # Process in smaller chunks to avoid memory overload
+#         chunk_size = 1024  # Adjust if needed
+#         aligned_chunks = []
+
+#         for i in range(0, input_features_r.shape[-1], chunk_size):
+#             input_chunk = input_features_r[:, :, i:i+chunk_size]
+#             ref_chunk = ref_features_r[:, :, i:i+chunk_size]
+
+#             # Sort in smaller chunks
+#             sorted_input_chunk, inds = torch.sort(input_chunk, dim=-1)
+#             sorted_ref_chunk = torch.sort(ref_chunk, dim=-1)[0]
+
+#             # Compute in-place to save memory
+#             sorted_ref_chunk.mul_(alpha).add_(sorted_input_chunk.mul(1 - alpha))
+
+#             # Get inverse indices
+#             inv_inds = inds.argsort(-1)
+
+#             # Apply inverse sorting
+#             aligned_chunk = sorted_ref_chunk.gather(-1, inv_inds)
+
+#             aligned_chunks.append(aligned_chunk)
+
+#         # Concatenate processed chunks back together
+#         aligned_features = torch.cat(aligned_chunks, dim=-1)
+
+#         # Move back to GPU in manageable chunks
+#         aligned_features = aligned_features.to("cuda").view(B, C, W, H)
+#         aligned_features_list.append(aligned_features)
+
+#         # Cleanup memory
+#         del input_features_r, ref_features_r, sorted_input_chunk, sorted_ref_chunk, inv_inds, aligned_chunks
+#         gc.collect()
+#         torch.cuda.empty_cache()
+
+#     return aligned_features_list
+
 def applying_EFDM(input_features_list, ref_features_list, alpha=0.5):
+    """
+    Args:
+        input_features (Tensor): shape of (B, C, H, W).
+        ref_features (Tensor): normal reference features, (B, C, H, W).
+    """
     alpha = 1 - alpha
     aligned_features_list = []
-
-    for l in range(len(input_features_list)):
+    print(len(input_features_list),input_features_list[0].shape)
+    for l in tqdm(range(len(input_features_list))):
+        print(l)
         input_features, ref_features = input_features_list[l], ref_features_list[l]
         B, C, W, H = input_features.shape
 
-        # Move to CPU and convert to float16 to save memory
-        input_features_r = input_features.reshape(B, C, -1).detach().cpu().to(torch.float16)
-        ref_features_r = ref_features.reshape(B, C, -1).detach().cpu().to(torch.float16)
+        input_features_r = input_features.reshape(B, C, -1).detach().cpu()
+        ref_features_r = ref_features.reshape(B, C, -1).detach().cpu()
 
-        # Process in smaller chunks to avoid memory overload
-        chunk_size = 1024  # Adjust if needed
-        aligned_chunks = []
-
-        for i in range(0, input_features_r.shape[-1], chunk_size):
-            input_chunk = input_features_r[:, :, i:i+chunk_size]
-            ref_chunk = ref_features_r[:, :, i:i+chunk_size]
-
-            # Sort in smaller chunks
-            sorted_input_chunk, inds = torch.sort(input_chunk, dim=-1)
-            sorted_ref_chunk = torch.sort(ref_chunk, dim=-1)[0]
-
-            # Compute in-place to save memory
-            sorted_ref_chunk.mul_(alpha).add_(sorted_input_chunk.mul(1 - alpha))
-
-            # Get inverse indices
-            inv_inds = inds.argsort(-1)
-
-            # Apply inverse sorting
-            aligned_chunk = sorted_ref_chunk.gather(-1, inv_inds)
-
-            aligned_chunks.append(aligned_chunk)
-
-        # Concatenate processed chunks back together
-        aligned_features = torch.cat(aligned_chunks, dim=-1)
-
-        # Move back to GPU in manageable chunks
-        aligned_features = aligned_features.to("cuda").view(B, C, W, H)
+        sorted_input_features, inds = torch.sort(input_features_r)
+        sorted_ref_features, _ = torch.sort(ref_features_r)
+        aligned_features = sorted_input_features +  alpha * (sorted_ref_features - sorted_input_features) 
+        inv_inds = inds.argsort(-1)
+        aligned_features = aligned_features.cuda()
+        inv_inds = inv_inds.cuda()
+        aligned_features = aligned_features.gather(-1, inv_inds)
+        aligned_features = aligned_features.view(B, C, W, H)
         aligned_features_list.append(aligned_features)
-
-        # Cleanup memory
-        del input_features_r, ref_features_r, sorted_input_chunk, sorted_ref_chunk, inv_inds, aligned_chunks
-        gc.collect()
-        torch.cuda.empty_cache()
 
     return aligned_features_list
 
