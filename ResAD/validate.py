@@ -38,6 +38,7 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
         label_list.append(label.cpu().numpy().astype(bool).ravel())
         
         image = image.to(device)
+        print("Image Shape:", image.shape)
         size = image.shape[-1]
         
         with torch.no_grad():
@@ -51,11 +52,15 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
                 feature1 = F.interpolate(feature1, size=(56, 56), mode="bilinear", align_corners=False)
                 feature2 = F.interpolate(feature2, size=(28, 28), mode="bilinear", align_corners=False)
                 feature3 = F.interpolate(feature3, size=(14, 14), mode="bilinear", align_corners=False)
+                print("Feature1 Shape:", feature1.shape, feature2.shape, feature3.shape)
                 features = [feature1, feature2, feature3]
                 del feature1, feature2, feature3
                 torch.cuda.empty_cache()
                 mfeatures = get_matched_ref_features(features, ref_features)
+                print("Matched Features Shape:", mfeatures[0].shape, mfeatures[1].shape, mfeatures[2].shape)
+                print("fEAT Shape:", features[0].shape, features[1].shape, features[2].shape)
                 rfeatures = get_residual_features(features, mfeatures, pos_flag=True)
+                print("Residual Features Shape:", rfeatures[0].shape, rfeatures[1].shape, rfeatures[2].shape)
                 del mfeatures
                 torch.cuda.empty_cache()
             else:
@@ -67,9 +72,13 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
                 rfeatures = get_residual_features(features, mfeatures)
             with torch.no_grad():
                 fdm_features = vq_ops(rfeatures, train=False)
+            
+
             rfeatures = applying_EFDM(rfeatures, fdm_features, alpha=args.fdm_alpha)
             rfeatures = [f.to(torch.float32) for f in rfeatures]
+            print("Residual Features before Constraintor: ", rfeatures[0].shape, rfeatures[1].shape, rfeatures[2].shape)
             rfeatures = constraintor(*rfeatures)
+            print("Residual Features after Constraintor: ", rfeatures[0].shape, rfeatures[1].shape, rfeatures[2].shape)
         
             for l in range(args.feature_levels):
                 e = rfeatures[l]  # BxCxHxW
@@ -87,6 +96,7 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
                         if args.flow_arch == 'flow_model':
                             z, log_jac_det = estimator(e)  
                         else:
+                            print("Before estimator shape:", e.shape)
                             z, log_jac_det = estimator(e, [pos_embed, ])
                 z = z.float()
                 log_jac_det = log_jac_det.float()
@@ -138,7 +148,6 @@ def convert_to_anomaly_scores(logps_list, feature_levels=3, class_name=None, siz
     # normality score to anomaly score
     scores = scores.max() - scores 
     
-    #if class_name in ['pill', 'cable', 'capsule', 'screw']:
     for i in range(scores.shape[0]):
         scores[i] = gaussian_filter(scores[i], sigma=4)
 
